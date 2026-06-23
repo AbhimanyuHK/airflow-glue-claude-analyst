@@ -8,7 +8,6 @@ JSON response into a dict consumed by the Slack Block Kit formatter.
 import os
 import json
 import logging
-from typing import Optional
 
 import anthropic
 
