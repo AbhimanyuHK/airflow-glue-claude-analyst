@@ -123,11 +123,13 @@ class TestFetchGlueLogs:
 
     def test_combines_error_and_output_groups(self, fetcher):
         f, client = fetcher
+        # _read_stream calls get_log_events twice per group:
+        #   call 1 → returns events, call 2 → same token signals no more pages
         client.get_log_events.side_effect = [
-            # error group
-            {"events": [_make_event("ERROR: Schema mismatch")], "nextForwardToken": "end"},
-            # output group
-            {"events": [_make_event("INFO: Job started")], "nextForwardToken": "end"},
+            {"events": [_make_event("ERROR: Schema mismatch")], "nextForwardToken": "tok1"},
+            {"events": [], "nextForwardToken": "tok1"},   # page end for error group
+            {"events": [_make_event("INFO: Job started")], "nextForwardToken": "tok2"},
+            {"events": [], "nextForwardToken": "tok2"},   # page end for output group
         ]
         job_info = {
             "source": "glue",
