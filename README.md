@@ -1,4 +1,5 @@
 # Airflow Glue Claude Analyst 🤖
+[![CI](https://github.com/AbhimanyuHK/airflow-glue-claude-analyst/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/AbhimanyuHK/airflow-glue-claude-analyst/actions/workflows/ci.yml)
 
 An AI-powered Slack bot that automatically diagnoses **Apache Airflow** and **AWS Glue** pipeline failures.
 
