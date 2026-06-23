@@ -208,10 +208,12 @@ def extract_job_info(text: str) -> dict:
 
         # Task id
         task_match = re.search(
-            r"task[_\s]*(?:id)?[:\s`'\"]+([A-Za-z0-9_\-]+)", text, re.IGNORECASE
+            r"task[_\s]*id[:\s`'\"]+([A-Za-z0-9_\-]+)"
+            r"|\bTask:\s*`?([A-Za-z0-9][A-Za-z0-9_\-]*[_\-][A-Za-z0-9_\-]+)`?",
+            text, re.IGNORECASE
         )
         if task_match:
-            info["task_id"] = task_match.group(1)
+            info["task_id"] = task_match.group(1) or task_match.group(2)
 
         # Run id — ISO timestamps like scheduled__2024-01-15T06:00:00+00:00
         run_match = re.search(
@@ -239,10 +241,12 @@ def extract_job_info(text: str) -> dict:
 
         # Job name — matches "Job: my-job", "job_name: my-job"
         job_match = re.search(
-            r"job[_\s]*(?:name)?[:\s`'\"]+([A-Za-z0-9_\-]+)", text, re.IGNORECASE
+            r"job[_\s]*name[:\s`'\"]+([A-Za-z0-9_\-]+)"
+            r"|\bJob:\s*`?([A-Za-z0-9][A-Za-z0-9_\-]*[_\-][A-Za-z0-9_\-]+)`?",
+            text, re.IGNORECASE
         )
         if job_match:
-            info["job_name"] = job_match.group(1)
+            info["job_name"] = job_match.group(1) or job_match.group(2)
 
         # Glue run id — always starts with "jr_"
         run_match = re.search(r"(jr_[A-Za-z0-9]+)", text)

@@ -246,12 +246,19 @@ class AWSLogFetcher:
         """
         If the log exceeds max_log_chars, keep the first 10 % (context)
         and the last 90 % (where errors usually appear).
+        The banner ("... [N characters omitted] ...") is accounted for so the
+        total output length stays below max_log_chars.
         """
         if len(text) <= self.max_log_chars:
             return text
 
-        head_size = max(500, self.max_log_chars // 10)
-        tail_size = self.max_log_chars - head_size - 60
+        # Reserve space for the banner + surrounding newlines (~60 chars)
+        banner = "\n\n... [{:,} characters omitted] ...\n\n"
+        banner_budget = len(banner.format(len(text)))  # worst-case banner length
+        usable = max(10, self.max_log_chars - banner_budget)
+
+        head_size = max(5, min(usable // 10, usable // 2))
+        tail_size = usable - head_size
 
         head = text[:head_size]
         tail = text[-tail_size:]
