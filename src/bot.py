@@ -20,141 +20,155 @@ from .claude_analyzer import ClaudeAnalyzer
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# App initialisation
+# App initialisation — lazy so pytest imports don't trigger token validation
 # ---------------------------------------------------------------------------
 
-app = App(token=os.environ["SLACK_BOT_TOKEN"])
-_log_fetcher = AWSLogFetcher()
-_analyzer = ClaudeAnalyzer()
+_app: App | None = None
+_log_fetcher: AWSLogFetcher | None = None
+_analyzer: ClaudeAnalyzer | None = None
 
 
 def create_app() -> App:
-    """Return the configured Slack Bolt app (useful for testing)."""
-    return app
+    """
+    Return the configured Slack Bolt app, initialising it on first call.
+    Keeping initialisation lazy means importing this module in tests never
+    touches the Slack API (no token validation at import time).
+    """
+    global _app, _log_fetcher, _analyzer
+    if _app is None:
+        _app = App(token=os.environ["SLACK_BOT_TOKEN"])
+        _log_fetcher = AWSLogFetcher()
+        _analyzer = ClaudeAnalyzer()
+        _register_handlers(_app)
+    return _app
 
 
 def start() -> None:
     """Start the bot using Socket Mode (no public URL required)."""
+    app = create_app()
     handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
     logger.info("⚡️  Airflow Glue Claude Analyst is running!")
     handler.start()
 
 
 # ---------------------------------------------------------------------------
-# Event handler
+# Event handler registration (called once inside create_app)
 # ---------------------------------------------------------------------------
 
-@app.event("app_mention")
-def handle_analyze_mention(event: dict, say, client) -> None:
-    """
-    Fires when someone mentions the bot in any channel it's a member of.
-    Only acts when the mention contains the word "analyze".
-    """
-    text = event.get("text", "").lower()
-    if "analyze" not in text:
-        return
+def _register_handlers(app: App) -> None:
+    """Attach all Slack event listeners to the app instance."""
 
-    channel_id: str = event["channel"]
-    thread_ts: str = event.get("thread_ts") or event["ts"]
-    user_id: str = event["user"]
+    @app.event("app_mention")
+    def handle_analyze_mention(event: dict, say, client) -> None:
+        """
+        Fires when someone mentions the bot in any channel it's a member of.
+        Only acts when the mention contains the word "analyze".
+        """
+        text = event.get("text", "").lower()
+        if "analyze" not in text:
+            return
 
-    logger.info("Analyze request from user=%s thread=%s", user_id, thread_ts)
+        channel_id: str = event["channel"]
+        thread_ts: str = event.get("thread_ts") or event["ts"]
+        user_id: str = event["user"]
 
-    # ── 1. Acknowledge immediately so the user knows the bot is working ──
-    say(
-        text="🔍 On it! Fetching logs and running analysis — give me a moment.",
-        thread_ts=thread_ts,
-        channel=channel_id,
-    )
+        logger.info("Analyze request from user=%s thread=%s", user_id, thread_ts)
 
-    try:
-        # ── 2. Fetch the original (root) message of the thread ──────────
-        result = client.conversations_replies(channel=channel_id, ts=thread_ts)
-        messages = result.get("messages", [])
-        if not messages:
+        # ── 1. Acknowledge immediately so the user knows the bot is working ──
+        say(
+            text="🔍 On it! Fetching logs and running analysis — give me a moment.",
+            thread_ts=thread_ts,
+            channel=channel_id,
+        )
+
+        try:
+            # ── 2. Fetch the original (root) message of the thread ──────────
+            result = client.conversations_replies(channel=channel_id, ts=thread_ts)
+            messages = result.get("messages", [])
+            if not messages:
+                say(
+                    text="⚠️ Could not read the thread. Make sure I have `channels:history` scope.",
+                    thread_ts=thread_ts,
+                    channel=channel_id,
+                )
+                return
+
+            original_text: str = messages[0].get("text", "")
+            attachments = messages[0].get("attachments", [])
+            # Some Airflow integrations put details in attachments
+            for att in attachments:
+                original_text += "\n" + att.get("text", "") + att.get("fallback", "")
+
+            # ── 3. Parse job metadata from the alert message ─────────────────
+            job_info = extract_job_info(original_text)
+
+            if not job_info["source"]:
+                say(
+                    text=(
+                        "⚠️ Could not identify this as an Airflow or Glue error.\n"
+                        "Make sure the original alert includes the DAG/job name and run ID."
+                    ),
+                    thread_ts=thread_ts,
+                    channel=channel_id,
+                )
+                return
+
+            source_label = job_info["source"].upper()
             say(
-                text="⚠️ Could not read the thread. Make sure I have `channels:history` scope.",
+                text=f"📡 Detected *{source_label}* error. Pulling CloudWatch logs…",
                 thread_ts=thread_ts,
                 channel=channel_id,
             )
-            return
 
-        original_text: str = messages[0].get("text", "")
-        attachments = messages[0].get("attachments", [])
-        # Some Airflow integrations put details in attachments
-        for att in attachments:
-            original_text += "\n" + att.get("text", "") + att.get("fallback", "")
+            # ── 4. Fetch logs from AWS CloudWatch ────────────────────────────
+            logs = _log_fetcher.fetch_logs(job_info)
 
-        # ── 3. Parse job metadata from the alert message ─────────────────
-        job_info = extract_job_info(original_text)
+            if not logs:
+                say(
+                    text=(
+                        "⚠️ Could not retrieve logs from CloudWatch.\n"
+                        "Check that the bot's IAM role has `logs:DescribeLogStreams` "
+                        "and `logs:GetLogEvents` permissions, and that the log group "
+                        f"`{job_info.get('log_group')}` exists."
+                    ),
+                    thread_ts=thread_ts,
+                    channel=channel_id,
+                )
+                return
 
-        if not job_info["source"]:
             say(
+                text="🤖 Logs retrieved! Running Claude AI root cause analysis…",
+                thread_ts=thread_ts,
+                channel=channel_id,
+            )
+
+            # ── 5. Claude analysis ───────────────────────────────────────────
+            analysis = _analyzer.analyze(
+                source=job_info["source"],
+                job_info=job_info,
+                original_alert=original_text,
+                logs=logs,
+            )
+
+            # ── 6. Post rich Block Kit reply in the same thread ──────────────
+            client.chat_postMessage(
+                channel=channel_id,
+                thread_ts=thread_ts,
+                blocks=_build_analysis_blocks(analysis, job_info),
                 text=(
-                    "⚠️ Could not identify this as an Airflow or Glue error.\n"
-                    "Make sure the original alert includes the DAG/job name and run ID."
+                    f"Root cause analysis for "
+                    f"{job_info.get('dag_id') or job_info.get('job_name', 'pipeline')}: "
+                    f"{analysis.get('root_cause', 'See thread for details.')}"
                 ),
-                thread_ts=thread_ts,
-                channel=channel_id,
             )
-            return
 
-        source_label = job_info["source"].upper()
-        say(
-            text=f"📡 Detected *{source_label}* error. Pulling CloudWatch logs…",
-            thread_ts=thread_ts,
-            channel=channel_id,
-        )
-
-        # ── 4. Fetch logs from AWS CloudWatch ────────────────────────────
-        logs = _log_fetcher.fetch_logs(job_info)
-
-        if not logs:
+        except Exception as exc:
+            logger.exception("Unhandled error during analysis")
             say(
-                text=(
-                    "⚠️ Could not retrieve logs from CloudWatch.\n"
-                    "Check that the bot's IAM role has `logs:DescribeLogStreams` "
-                    "and `logs:GetLogEvents` permissions, and that the log group "
-                    f"`{job_info.get('log_group')}` exists."
-                ),
+                text=f"❌ Something went wrong during analysis: `{exc}`",
                 thread_ts=thread_ts,
                 channel=channel_id,
             )
-            return
-
-        say(
-            text="🤖 Logs retrieved! Running Claude AI root cause analysis…",
-            thread_ts=thread_ts,
-            channel=channel_id,
-        )
-
-        # ── 5. Claude analysis ───────────────────────────────────────────
-        analysis = _analyzer.analyze(
-            source=job_info["source"],
-            job_info=job_info,
-            original_alert=original_text,
-            logs=logs,
-        )
-
-        # ── 6. Post rich Block Kit reply in the same thread ──────────────
-        client.chat_postMessage(
-            channel=channel_id,
-            thread_ts=thread_ts,
-            blocks=_build_analysis_blocks(analysis, job_info),
-            text=(
-                f"Root cause analysis for "
-                f"{job_info.get('dag_id') or job_info.get('job_name', 'pipeline')}: "
-                f"{analysis.get('root_cause', 'See thread for details.')}"
-            ),
-        )
-
-    except Exception as exc:
-        logger.exception("Unhandled error during analysis")
-        say(
-            text=f"❌ Something went wrong during analysis: `{exc}`",
-            thread_ts=thread_ts,
-            channel=channel_id,
-        )
 
 
 # ---------------------------------------------------------------------------
